@@ -1,4 +1,4 @@
-[openai]
+﻿[openai]
 # Replace with your actual API key
 api_key = "YOUR_API_KEY_HERE"
 model = "qwen3-coder-next"
@@ -10,3 +10,11 @@ max_retries = 2
 [negotiation]
 min_rounds = 2
 max_rounds = 5
+
+[optimization]
+enable_tool_calling = true
+tool_call_fallback_json = true
+enable_adaptive_rounds = true
+enable_layer_cache = true
+fast_path_max_rounds = 2
+quality_guardrail_min_agreement = 0.98

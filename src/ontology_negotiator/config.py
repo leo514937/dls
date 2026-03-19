@@ -43,6 +43,19 @@ class NegotiationConfig(BaseModel):
     max_rounds: int = 5
 
 
+class OptimizationConfig(BaseModel):
+    """Runtime optimization toggles for speed-first layered execution."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enable_tool_calling: bool = True
+    tool_call_fallback_json: bool = True
+    enable_adaptive_rounds: bool = True
+    enable_layer_cache: bool = True
+    fast_path_max_rounds: int = 2
+    quality_guardrail_min_agreement: float = 0.98
+
+
 class AppConfig(BaseModel):
     """Top-level application config."""
 
@@ -50,9 +63,10 @@ class AppConfig(BaseModel):
 
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     llm_retry: LLMRetryConfig = Field(default_factory=LLMRetryConfig)
-
-
     negotiation: NegotiationConfig = Field(default_factory=NegotiationConfig)
+    optimization: OptimizationConfig = Field(default_factory=OptimizationConfig)
+
+
 def default_config_path() -> Path:
     """Return the repository default config path."""
     return Path(__file__).resolve().parents[2] / "config" / "ontology_negotiator.toml"
@@ -106,5 +120,4 @@ def build_chat_openai_kwargs(
         merged_kwargs["max_retries"] = openai_config.max_retries
     merged_kwargs.update(llm_kwargs)
     return merged_kwargs
-
 

@@ -1,6 +1,12 @@
-"""对外导出 OntologyNegotiator 的公共接口。"""
+﻿"""Public exports for OntologyNegotiator."""
 
-from ontology_negotiator.config import AppConfig, OpenAIConfig, build_chat_openai_kwargs, load_app_config
+from ontology_negotiator.config import (
+    AppConfig,
+    OpenAIConfig,
+    OptimizationConfig,
+    build_chat_openai_kwargs,
+    load_app_config,
+)
 from ontology_negotiator.errors import NegotiationConfigurationError, NegotiationExecutionError
 from ontology_negotiator.models import (
     ArbiterPayload,
@@ -32,6 +38,7 @@ __all__ = [
     "NegotiationExecutionError",
     "OntologyNegotiator",
     "OpenAIConfig",
+    "OptimizationConfig",
     "ProposalPayload",
     "VaultContextPayload",
     "build_chat_openai_kwargs",

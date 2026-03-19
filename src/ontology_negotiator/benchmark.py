@@ -38,6 +38,77 @@ def _round_seconds(value: float) -> float:
     return round(value, 6)
 
 
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(item) for item in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (max(0.0, min(100.0, percentile)) / 100.0) * (len(ordered) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = rank - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _build_agent_latency_distribution(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[float]] = {}
+    for step in steps:
+        agent_name = str(step.get("agent_name", ""))
+        duration = float(step.get("duration_seconds", 0.0) or 0.0)
+        grouped.setdefault(agent_name, []).append(duration)
+
+    distribution: list[dict[str, Any]] = []
+    for agent_name, durations in grouped.items():
+        distribution.append(
+            {
+                "agent_name": agent_name,
+                "count": len(durations),
+                "p50_seconds": _round_seconds(_percentile(durations, 50.0)),
+                "p95_seconds": _round_seconds(_percentile(durations, 95.0)),
+                "max_seconds": _round_seconds(max(durations) if durations else 0.0),
+            }
+        )
+    return sorted(distribution, key=lambda item: str(item["agent_name"]))
+
+
+def _summarize_trace_metrics(node_summaries: list[dict[str, Any]], all_steps: list[dict[str, Any]]) -> dict[str, Any]:
+    traces: list[dict[str, Any]] = []
+    cache_hits = 0
+    for node_summary in node_summaries:
+        traces.extend(list(node_summary.get("llm_trace", [])))
+        cache_hits += int(node_summary.get("cache_hits", {}).get("total", 0) or 0)
+
+    tool_attempts = sum(1 for item in traces if item.get("tool_call_attempted"))
+    tool_successes = sum(1 for item in traces if item.get("tool_call_used"))
+    schema_repairs = sum(1 for item in traces if str(item.get("stage", "")) == "schema_repair")
+    retries = sum(max(0, int(item.get("attempts", 1) or 1) - 1) for item in traces)
+    fallback_uses = sum(1 for item in traces if bool(item.get("fallback_used", False)))
+
+    prompt_tokens = sum(int(item.get("prompt_tokens", 0) or 0) for item in traces)
+    completion_tokens = sum(int(item.get("completion_tokens", 0) or 0) for item in traces)
+    total_tokens = sum(int(item.get("total_tokens", 0) or 0) for item in traces)
+
+    llm_invocations = max(1, len(traces))
+    agent_invocations = max(1, len(all_steps))
+
+    return {
+        "tool_call_success_rate": _round_seconds(tool_successes / max(1, tool_attempts)),
+        "schema_repair_rate": _round_seconds(schema_repairs / agent_invocations),
+        "retry_count": retries,
+        "fallback_count": fallback_uses,
+        "cache_hit_rate": _round_seconds(cache_hits / (cache_hits + llm_invocations)),
+        "cache_hit_count": cache_hits,
+        "tool_call_attempts": tool_attempts,
+        "tool_call_successes": tool_successes,
+        "token_usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+
+
 def _aggregate_agent_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     totals: dict[str, dict[str, Any]] = {}
     for step in steps:
@@ -172,7 +243,7 @@ class BenchmarkedOntologyNegotiator(OntologyNegotiator):
         return result, state, [_to_jsonable(item) for item in profiler.events]
 
     def _build_profiled_runtime(self, profiler: WorkflowProfiler) -> Any:
-        agents = TimedNegotiationAgents(NegotiationAgents(llm=self.llm, fallback_llm=self.fallback_llm, retry_policy=self.retry_policy), profiler)
+        agents = TimedNegotiationAgents(NegotiationAgents(llm=self.llm, fallback_llm=self.fallback_llm, retry_policy=self.retry_policy, optimization=self.app_config.optimization, cache_store=self.cache_store, fast_llm=self.fast_llm, quality_llm=self.quality_llm), profiler)
         workflow = build_negotiation_graph(agents)
         return type("BenchmarkedRuntime", (), {"agents": agents, "workflow": workflow})()
 
@@ -185,6 +256,10 @@ def build_benchmark_summary(report: dict[str, Any]) -> str:
         f"Total elapsed seconds: {report['total_seconds']}",
         f"Processed nodes: {report['node_count']}",
         f"Average round count: {report['average_round_count']}",
+        f"Avg rounds per node: {report.get('avg_rounds_per_node', report['average_round_count'])}",
+        f"Tool-call success rate: {report.get('tool_call_success_rate', 0.0)}",
+        f"Schema-repair rate: {report.get('schema_repair_rate', 0.0)}",
+        f"Cache-hit rate: {report.get('cache_hit_rate', 0.0)}",
     ]
 
     slowest_step = report.get("slowest_step_overall")
@@ -255,6 +330,10 @@ def _build_node_summary(
         "slowest_step": _slowest_step(agent_steps),
         "final_result": result.model_dump(mode="json"),
         "debate_log_path": state.get("debate_log_path"),
+        "llm_trace": list(state.get("llm_trace", [])),
+        "cache_hits": dict(state.get("cache_hits", {})),
+        "execution_path": str(state.get("execution_path", "")),
+        "early_exit_reason": str(state.get("early_exit_reason", "")),
     }
 
 
@@ -406,9 +485,11 @@ def run_full_pipeline_benchmark(
     for node_summary in node_summaries:
         all_steps.extend(node_summary["agent_steps"])
     agent_rank_by_total_time = _aggregate_agent_steps(all_steps)
+    agent_latency_distribution = _build_agent_latency_distribution(all_steps)
     average_round_count = _round_seconds(
         sum(float(item["round_count"]) for item in node_summaries) / len(node_summaries)
     ) if node_summaries else 0.0
+    trace_metrics = _summarize_trace_metrics(node_summaries, all_steps)
 
     diagnostics_dir = negotiator.artifacts.diagnostics_dir
     agent_outputs_path = diagnostics_dir / "full_pipeline_agent_outputs.json"
@@ -429,17 +510,19 @@ def run_full_pipeline_benchmark(
         "node_count": len(graph_model.nodes),
         "max_concurrency": validated_max_concurrency,
         "average_round_count": average_round_count,
+        "avg_rounds_per_node": average_round_count,
         "agent_rank_by_total_time": agent_rank_by_total_time,
+        "agent_latency_distribution": agent_latency_distribution,
         "slowest_step_overall": _slowest_step(all_steps),
         "slowest_agent_total": agent_rank_by_total_time[0] if agent_rank_by_total_time else None,
         "node_summaries": node_summaries,
         "final_results": [item.model_dump(mode="json") for item in final_results],
         "written_files": written_files,
+        **trace_metrics,
     }
 
     agent_outputs_path.write_text(json.dumps(all_steps, ensure_ascii=False, indent=2), encoding="utf-8")
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     summary_path.write_text(build_benchmark_summary(report), encoding="utf-8")
     return report
-
 

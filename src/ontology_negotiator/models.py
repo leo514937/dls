@@ -199,6 +199,12 @@ class LLMTracePayload(BaseModel):
     fallback_used: bool = False
     attempts: int = 1
     success: bool = True
+    tool_call_attempted: bool = False
+    tool_call_used: bool = False
+    cache_hit: bool = False
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 class PersistentEvidencePayload(BaseModel):
@@ -251,4 +257,7 @@ class NegotiationState(TypedDict, total=False):
     persistent_evidence: list[dict[str, Any]]
     resolved_evidence: list[dict[str, Any]]
     evidence_events: list[dict[str, Any]]
+    execution_path: str
+    early_exit_reason: str
+    cache_hits: dict[str, int]
 

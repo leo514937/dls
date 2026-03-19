@@ -15,12 +15,20 @@ from ontology_negotiator.models import (
     CritiquePayload,
     EvaluationReportPayload,
     EvidenceEventPayload,
-    LLMTracePayload,    NegotiationState,
+    LLMTracePayload,
+    NegotiationState,
     PersistentEvidencePayload,
     ProposalPayload,
 )
 from ontology_negotiator.prompts import load_system_prompt
-from ontology_negotiator.config import LLMRetryConfig
+from ontology_negotiator.config import LLMRetryConfig, OptimizationConfig
+from ontology_negotiator.optimization import (
+    LayerCacheStore,
+    extract_response_token_usage,
+    extract_tool_call_arguments,
+    resolve_model_name as resolve_model_name_from_client,
+    stable_cache_key,
+)
 
 try:
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -127,7 +135,8 @@ _SEMANTIC_ANCHOR_PATTERNS: dict[str, tuple[str, ...]] = {
         "\u7c7b\u5b9a\u4e49",
     ),
     "instance_binding": (
-        "instance",
+        "single instance",
+        "specific instance",
         "deployment id",
         "single execution",
         "timestamp",
@@ -142,6 +151,12 @@ _SEMANTIC_ANCHOR_PATTERNS: dict[str, tuple[str, ...]] = {
         "\u65f6\u95f4\u6233",
         "\u9879\u76ee\u5b9e\u4f8b",
     ),
+}
+_SEMANTIC_ANCHOR_PRIORITY: dict[str, int] = {
+    "foundational_principle": 0,
+    "cross_instance_constraint": 1,
+    "reusable_template": 2,
+    "instance_binding": 3,
 }
 _LABEL_SEMANTIC_PRIORS: dict[str, set[str]] = {
     "\u8fbe": {"foundational_principle", "cross_instance_constraint"},
@@ -274,9 +289,22 @@ def _append_llm_trace(
             fallback_used=bool(metadata.get("fallback_used", False)),
             attempts=int(metadata.get("attempts", 1) or 1),
             success=bool(metadata.get("success", True)),
+            tool_call_attempted=bool(metadata.get("tool_call_attempted", False)),
+            tool_call_used=bool(metadata.get("tool_call_used", False)),
+            cache_hit=bool(metadata.get("cache_hit", False)),
+            prompt_tokens=metadata.get("prompt_tokens"),
+            completion_tokens=metadata.get("completion_tokens"),
+            total_tokens=metadata.get("total_tokens"),
         ).model_dump(mode="json")
     )
     state["llm_trace"] = traces
+
+
+def _increment_cache_hit(state: NegotiationState, layer: str) -> None:
+    counters = dict(state.get("cache_hits", {}))
+    counters[layer] = int(counters.get(layer, 0)) + 1
+    counters["total"] = int(counters.get("total", 0)) + 1
+    state["cache_hits"] = counters
 
 
 def _resolve_model_name(llm: Any | None) -> str | None:
@@ -631,6 +659,13 @@ def _extract_object_terms(text: str) -> set[str]:
     return set(sorted(filtered)[:6])
 
 
+def _sort_semantic_anchor_terms(terms: set[str] | list[str]) -> list[str]:
+    return sorted(
+        {str(item) for item in terms if str(item).strip()},
+        key=lambda item: (_SEMANTIC_ANCHOR_PRIORITY.get(item, 99), item),
+    )
+
+
 def _extract_semantic_anchor_terms(text: str) -> set[str]:
     lowered = str(text).lower()
     matched = {
@@ -638,17 +673,16 @@ def _extract_semantic_anchor_terms(text: str) -> set[str]:
         for label, candidates in _SEMANTIC_ANCHOR_PATTERNS.items()
         if any(candidate.lower() in lowered for candidate in candidates)
     }
-    if "grounded_in" in lowered and "foundational universal principle" in lowered:
+    if "grounded_in" in lowered or "grounded in" in lowered:
         matched.add("foundational_principle")
     return matched
-
 
 def _build_signature(text: str, claim_type: str | None = None) -> dict[str, Any]:
     anchor_refs = sorted(_extract_refs(text))
     object_terms = sorted(_extract_object_terms(text))
     signature = {
         "anchor_refs": anchor_refs,
-        "semantic_anchor_terms": sorted(_extract_semantic_anchor_terms(text)),
+        "semantic_anchor_terms": _sort_semantic_anchor_terms(_extract_semantic_anchor_terms(text)),
         "logic_operator": _extract_logic_operator(text),
         "object_terms": object_terms,
         "claim_type": claim_type or _extract_claim_type(text),
@@ -679,7 +713,7 @@ def _merge_signatures(signatures: list[dict[str, Any]]) -> dict[str, Any]:
             claim_types.add(claim_type)
     return {
         "anchor_refs": sorted(anchor_refs),
-        "semantic_anchor_terms": sorted(semantic_anchor_terms),
+        "semantic_anchor_terms": _sort_semantic_anchor_terms(semantic_anchor_terms),
         "logic_operator": sorted(logic_ops),
         "object_terms": sorted(object_terms),
         "claim_type": sorted(claim_types),
@@ -745,9 +779,12 @@ def _signatures_equivalent(left: dict[str, Any] | None, right: dict[str, Any] | 
             return False
 
     if not left_anchors and not right_anchors and not left_semantic and not right_semantic:
-        if left_logic == right_logic and left_claim == right_claim and _overlap_ratio(left_objects, right_objects) >= 0.6:
-            return True
-
+        if left_logic == right_logic and left_claim == right_claim:
+            if _overlap_ratio(left_objects, right_objects) >= 0.6:
+                return True
+            shared_objects = left_objects & right_objects
+            if left_logic != {"general_check"} and len(shared_objects) >= 2:
+                return True
     combined_left = left_objects | left_tokens
     combined_right = right_objects | right_tokens
     if left_logic == right_logic and left_claim == right_claim and _overlap_ratio(combined_left, combined_right) >= 0.75:
@@ -885,7 +922,7 @@ def _is_verifiable_focus(text: str) -> bool:
     return any(keyword in lower_focus for keyword in keywords)
 def _build_logic_path(signature: dict[str, Any]) -> str:
     anchor_refs = list(signature.get("anchor_refs", []))
-    semantic_anchor_terms = list(signature.get("semantic_anchor_terms", []))
+    semantic_anchor_terms = _sort_semantic_anchor_terms(list(signature.get("semantic_anchor_terms", [])))
     if anchor_refs:
         anchor = ",".join(anchor_refs)
     elif semantic_anchor_terms:
@@ -1403,7 +1440,8 @@ def _analyze_round_progress(
     next_focus_narrowed = not _signatures_equivalent(current_focus_signature, current_next_focus_signature)
     same_logic_path = _signatures_equivalent(current_logic_path_signature, previous_logic_path_signature)
     same_active_evidence = set(active_evidence_ids) == previous_active_evidence_ids
-    next_focus_new_anchor = bool(set(current_next_focus_signature.get("anchor_refs", [])) - set(current_focus_signature.get("anchor_refs", [])))
+    previous_focus_anchors = _as_set(previous_focus_signature.get("anchor_refs", []) if isinstance(previous_focus_signature, dict) else [])
+    next_focus_new_anchor = bool(set(current_next_focus_signature.get("anchor_refs", [])) - previous_focus_anchors)
     semantic_progress_detected = bool(
         new_evidence_detected
         or not same_logic_path
@@ -1627,16 +1665,112 @@ class NegotiationAgents:
         retry_policy: LLMRetryConfig | None = None,
         min_rounds: int = 2,
         max_rounds: int = 5,
+        optimization: OptimizationConfig | None = None,
+        cache_store: LayerCacheStore | None = None,
+        fast_llm: Any | None = None,
+        quality_llm: Any | None = None,
     ) -> None:
         self.llm = llm
         self.fallback_llm = fallback_llm
+        self.fast_llm = fast_llm or llm
+        self.quality_llm = quality_llm or llm
         self.retry_policy = retry_policy or LLMRetryConfig()
+        self.optimization = optimization or OptimizationConfig()
+        self.cache_store = cache_store
+
         self.min_rounds = int(min_rounds)
         self.max_rounds = int(max_rounds)
         if self.min_rounds < 1:
             self.min_rounds = 1
         if self.max_rounds < self.min_rounds:
             self.max_rounds = self.min_rounds
+
+        configured_fast_rounds = int(self.optimization.fast_path_max_rounds)
+        self.fast_path_max_rounds = max(self.min_rounds, min(configured_fast_rounds, self.max_rounds))
+        self.quality_guardrail = max(0.0, min(1.0, float(self.optimization.quality_guardrail_min_agreement)))
+
+    def _select_llm_for_agent(self, agent_name: str) -> Any:
+        if agent_name in {"proposer", "critic"}:
+            return self.fast_llm
+        return self.quality_llm
+
+    def _select_fallback_for_agent(self, agent_name: str) -> Any | None:
+        return self.fallback_llm
+
+    def _build_agent_cache_key(
+        self,
+        *,
+        agent_name: str,
+        payload: dict[str, Any],
+        iteration: int,
+        llm_model: str | None,
+    ) -> str:
+        return stable_cache_key(
+            {
+                "agent": agent_name,
+                "iteration": iteration,
+                "model": llm_model,
+                "payload": payload,
+            }
+        )
+
+    def _estimate_agreement_score(
+        self,
+        *,
+        state: NegotiationState,
+        unresolved_gaps: list[str],
+        explicit_conflict: bool,
+        consensus_signal: bool,
+        loop_detected: bool,
+    ) -> float:
+        proposal = state.get("proposal", {}) if isinstance(state.get("proposal", {}), dict) else {}
+        confidence_hint = float(proposal.get("confidence_hint", 0.0) or 0.0)
+        score = confidence_hint
+        if consensus_signal:
+            score += 0.18
+        if not explicit_conflict:
+            score += 0.10
+        if not unresolved_gaps:
+            score += 0.08
+        if not loop_detected:
+            score += 0.05
+        if bool(state.get("vault_context", {}).get("matched", False)):
+            score += 0.03
+        return max(0.0, min(1.0, score))
+
+    def _decide_execution_path(
+        self,
+        *,
+        state: NegotiationState,
+        iterations: int,
+        unresolved_gaps: list[str],
+        explicit_conflict: bool,
+        consensus_signal: bool,
+        loop_detected: bool,
+    ) -> tuple[str, float]:
+        if not self.optimization.enable_adaptive_rounds:
+            return "deep", 0.0
+
+        agreement_score = self._estimate_agreement_score(
+            state=state,
+            unresolved_gaps=unresolved_gaps,
+            explicit_conflict=explicit_conflict,
+            consensus_signal=consensus_signal,
+            loop_detected=loop_detected,
+        )
+
+        if loop_detected or explicit_conflict:
+            return "deep", agreement_score
+
+        if (
+            consensus_signal
+            and not unresolved_gaps
+            and iterations <= self.fast_path_max_rounds
+            and agreement_score >= self.quality_guardrail
+        ):
+            return "fast", agreement_score
+
+        return "deep", agreement_score
 
     def _raise_execution_error(
         self,
@@ -1669,8 +1803,15 @@ class NegotiationAgents:
     ) -> dict[str, Any]:
         prompt_name = f"{agent_name}_system"
         prompt = load_system_prompt(agent_name, min_rounds=self.min_rounds, max_rounds=self.max_rounds)
+        response_model = AGENT_RESPONSE_MODELS[agent_name]
+        iteration = int(state.get("iterations", 1))
 
-        if self.llm is None:
+        active_llm = self._select_llm_for_agent(agent_name)
+        fallback_llm = self._select_fallback_for_agent(agent_name)
+        active_model_name = resolve_model_name_from_client(active_llm)
+        fallback_model_name = resolve_model_name_from_client(fallback_llm)
+
+        if active_llm is None:
             self._raise_execution_error(
                 state=state,
                 agent_name=agent_name,
@@ -1680,7 +1821,38 @@ class NegotiationAgents:
                 prompt_name=prompt_name,
             )
 
-        def _invoke_client(client: Any) -> Any:
+        cache_key = self._build_agent_cache_key(
+            agent_name=agent_name,
+            payload=payload,
+            iteration=iteration,
+            llm_model=active_model_name,
+        )
+        if self.optimization.enable_layer_cache and self.cache_store is not None:
+            cached = self.cache_store.get_agent(cache_key)
+            if cached is not None:
+                try:
+                    validated_cached = response_model.model_validate(cached).model_dump(mode="json")
+                    _increment_cache_hit(state, "agent")
+                    _append_llm_trace(
+                        state,
+                        agent_name=agent_name,
+                        stage="cache_hit",
+                        iteration=iteration,
+                        prompt_name=prompt_name,
+                        trace_metadata={
+                            "llm_model": active_model_name,
+                            "fallback_model": fallback_model_name,
+                            "fallback_used": False,
+                            "attempts": 0,
+                            "success": True,
+                            "cache_hit": True,
+                        },
+                    )
+                    return validated_cached
+                except Exception:
+                    pass
+
+        def _invoke_client_json(client: Any) -> Any:
             if SystemMessage is not None and HumanMessage is not None:
                 response = client.invoke(
                     [
@@ -1699,18 +1871,112 @@ class NegotiationAgents:
                 )
             return getattr(response, "content", response)
 
-        if hasattr(self.llm, "generate_json"):
-            call = lambda: self.llm.generate_json(agent_name, payload)
+        def _invoke_client_tool(client: Any) -> Any:
+            if not hasattr(client, "bind_tools"):
+                raise ValueError("LLM does not support bind_tools.")
+            bound_client = client.bind_tools([response_model], tool_choice="any")
+            if SystemMessage is not None and HumanMessage is not None:
+                return bound_client.invoke(
+                    [
+                        SystemMessage(content=prompt),
+                        HumanMessage(
+                            content=(
+                                "Use a tool call to return the final structured output only."
+                                f"\nagent_name={agent_name}\ninput={json.dumps(payload, ensure_ascii=False)}"
+                            )
+                        ),
+                    ]
+                )
+            return bound_client.invoke(
+                f"{prompt}\nUse a tool call only.\n{json.dumps(payload, ensure_ascii=False)}"
+            )
+
+        tool_call_attempted = False
+        if (
+            self.optimization.enable_tool_calling
+            and hasattr(active_llm, "invoke")
+            and hasattr(active_llm, "bind_tools")
+        ):
+            tool_call_attempted = True
+            tool_trace_metadata: dict[str, Any] = {
+                "tool_call_attempted": True,
+                "tool_call_used": False,
+            }
+            try:
+                tool_raw = invoke_llm_with_retry(
+                    call=lambda: _invoke_client_tool(active_llm),
+                    fallback_call=(
+                        (lambda: _invoke_client_tool(fallback_llm))
+                        if fallback_llm is not None and hasattr(fallback_llm, "invoke") and hasattr(fallback_llm, "bind_tools")
+                        else None
+                    ),
+                    node_id=state.get("node_data", {}).get("node_id"),
+                    agent_name=agent_name,
+                    stage="llm_invoke",
+                    iteration=iteration,
+                    prompt_name=prompt_name,
+                    max_attempts=max(1, int(self.retry_policy.max_attempts)),
+                    base_delay_seconds=float(self.retry_policy.base_delay_seconds),
+                    max_delay_seconds=float(self.retry_policy.max_delay_seconds),
+                    jitter_seconds=float(self.retry_policy.jitter_seconds),
+                    primary_model=active_model_name,
+                    fallback_model=fallback_model_name,
+                    trace_metadata=tool_trace_metadata,
+                )
+                tool_trace_metadata.update(extract_response_token_usage(tool_raw))
+                tool_payload = extract_tool_call_arguments(tool_raw)
+                validated_tool_payload = response_model.model_validate(tool_payload).model_dump(mode="json")
+                tool_trace_metadata.update({"tool_call_used": True, "success": True})
+                _append_llm_trace(
+                    state,
+                    agent_name=agent_name,
+                    stage="llm_invoke",
+                    iteration=iteration,
+                    prompt_name=prompt_name,
+                    trace_metadata=tool_trace_metadata,
+                )
+                if self.optimization.enable_layer_cache and self.cache_store is not None:
+                    self.cache_store.set_agent(cache_key, validated_tool_payload)
+                return validated_tool_payload
+            except Exception as tool_exc:
+                _append_llm_trace(
+                    state,
+                    agent_name=agent_name,
+                    stage="tool_call",
+                    iteration=iteration,
+                    prompt_name=prompt_name,
+                    trace_metadata={
+                        "llm_model": active_model_name,
+                        "fallback_model": fallback_model_name,
+                        "fallback_used": False,
+                        "attempts": 1,
+                        "success": False,
+                        "tool_call_attempted": True,
+                        "tool_call_used": False,
+                    },
+                )
+                if not self.optimization.tool_call_fallback_json:
+                    self._raise_execution_error(
+                        state=state,
+                        agent_name=agent_name,
+                        stage="tool_call",
+                        message=f"Tool call failed and JSON fallback is disabled: {tool_exc}",
+                        raw_response=tool_exc,
+                        prompt_name=prompt_name,
+                    )
+
+        if hasattr(active_llm, "generate_json"):
+            call = lambda: active_llm.generate_json(agent_name, payload)
             fallback_call = (
-                (lambda: self.fallback_llm.generate_json(agent_name, payload))
-                if self.fallback_llm is not None and hasattr(self.fallback_llm, "generate_json")
+                (lambda: fallback_llm.generate_json(agent_name, payload))
+                if fallback_llm is not None and hasattr(fallback_llm, "generate_json")
                 else None
             )
-        elif hasattr(self.llm, "invoke"):
-            call = lambda: _invoke_client(self.llm)
+        elif hasattr(active_llm, "invoke"):
+            call = lambda: _invoke_client_json(active_llm)
             fallback_call = (
-                (lambda: _invoke_client(self.fallback_llm))
-                if self.fallback_llm is not None and hasattr(self.fallback_llm, "invoke")
+                (lambda: _invoke_client_json(fallback_llm))
+                if fallback_llm is not None and hasattr(fallback_llm, "invoke")
                 else None
             )
         else:
@@ -1723,28 +1989,31 @@ class NegotiationAgents:
                 prompt_name=prompt_name,
             )
 
-        trace_metadata: dict[str, Any] = {}
+        trace_metadata: dict[str, Any] = {
+            "tool_call_attempted": tool_call_attempted,
+            "tool_call_used": False,
+        }
         raw_response: Any = invoke_llm_with_retry(
             call=call,
             fallback_call=fallback_call,
             node_id=state.get("node_data", {}).get("node_id"),
             agent_name=agent_name,
             stage="llm_invoke",
-            iteration=int(state.get("iterations", 1)),
+            iteration=iteration,
             prompt_name=prompt_name,
             max_attempts=max(1, int(self.retry_policy.max_attempts)),
             base_delay_seconds=float(self.retry_policy.base_delay_seconds),
             max_delay_seconds=float(self.retry_policy.max_delay_seconds),
             jitter_seconds=float(self.retry_policy.jitter_seconds),
-            primary_model=_resolve_model_name(self.llm),
-            fallback_model=_resolve_model_name(self.fallback_llm),
+            primary_model=active_model_name,
+            fallback_model=fallback_model_name,
             trace_metadata=trace_metadata,
         )
         _append_llm_trace(
             state,
             agent_name=agent_name,
             stage="llm_invoke",
-            iteration=int(state.get("iterations", 1)),
+            iteration=iteration,
             prompt_name=prompt_name,
             trace_metadata=trace_metadata,
         )
@@ -1761,12 +2030,11 @@ class NegotiationAgents:
                 prompt_name=prompt_name,
             )
 
-        response_model = AGENT_RESPONSE_MODELS[agent_name]
         try:
             validated = response_model.model_validate(parsed)
         except Exception as exc:
-            if hasattr(self.llm, "invoke"):
-                print(f"  [Schema Repair 寮€濮媇 鑺傜偣={state.get('node_data', {}).get('node_id')} Agent={agent_name} 鍘熷洜={_truncate_text(str(exc), 100)}", flush=True)
+            allow_schema_repair = (not self.optimization.enable_tool_calling) and hasattr(active_llm, "invoke")
+            if allow_schema_repair:
                 schema_hint = response_model.model_json_schema()
                 repair_prompt = (
                     "The previous JSON did not satisfy the required schema. "
@@ -1777,50 +2045,52 @@ class NegotiationAgents:
                     f"\nschema={json.dumps(schema_hint, ensure_ascii=False)}"
                     f"\ninvalid_json={json.dumps(parsed, ensure_ascii=False)}"
                 )
-                try:
-                    def _invoke_repair(client: Any) -> Any:
+
+                def _invoke_repair(client: Any) -> Any:
+                    if SystemMessage is not None and HumanMessage is not None:
                         repair_response = client.invoke(
                             [
                                 SystemMessage(content=prompt),
                                 HumanMessage(content=repair_prompt),
                             ]
                         )
-                        return getattr(repair_response, "content", repair_response)
+                    else:
+                        repair_response = client.invoke(f"{prompt}\n{repair_prompt}")
+                    return getattr(repair_response, "content", repair_response)
 
-                    repair_trace_metadata: dict[str, Any] = {}
+                repair_trace_metadata: dict[str, Any] = {}
+                try:
                     repaired_raw = invoke_llm_with_retry(
-                        call=lambda: _invoke_repair(self.llm),
+                        call=lambda: _invoke_repair(active_llm),
                         fallback_call=(
-                            (lambda: _invoke_repair(self.fallback_llm))
-                            if self.fallback_llm is not None and hasattr(self.fallback_llm, "invoke")
+                            (lambda: _invoke_repair(fallback_llm))
+                            if fallback_llm is not None and hasattr(fallback_llm, "invoke")
                             else None
                         ),
                         node_id=state.get("node_data", {}).get("node_id"),
                         agent_name=agent_name,
                         stage="schema_repair",
-                        iteration=int(state.get("iterations", 1)),
+                        iteration=iteration,
                         prompt_name=prompt_name,
                         max_attempts=max(1, int(self.retry_policy.max_attempts)),
                         base_delay_seconds=float(self.retry_policy.base_delay_seconds),
                         max_delay_seconds=float(self.retry_policy.max_delay_seconds),
                         jitter_seconds=float(self.retry_policy.jitter_seconds),
-                        primary_model=_resolve_model_name(self.llm),
-                        fallback_model=_resolve_model_name(self.fallback_llm),
+                        primary_model=active_model_name,
+                        fallback_model=fallback_model_name,
                         trace_metadata=repair_trace_metadata,
                     )
                     _append_llm_trace(
                         state,
                         agent_name=agent_name,
                         stage="schema_repair",
-                        iteration=int(state.get("iterations", 1)),
+                        iteration=iteration,
                         prompt_name=prompt_name,
                         trace_metadata=repair_trace_metadata,
                     )
                     repaired_parsed = _extract_json(repaired_raw)
                     validated = response_model.model_validate(repaired_parsed)
-                    print(f"  [Schema Repair 鎴愬姛] 鑺傜偣={state.get('node_data', {}).get('node_id')} Agent={agent_name}", flush=True)
-                except Exception as repair_exc:
-                    print(f"  [Schema Repair 澶辫触] 鑺傜偣={state.get('node_data', {}).get('node_id')} Agent={agent_name} 閿欒={_truncate_text(str(repair_exc), 100)}", flush=True)
+                except Exception:
                     self._raise_execution_error(
                         state=state,
                         agent_name=agent_name,
@@ -1838,7 +2108,12 @@ class NegotiationAgents:
                     raw_response=parsed,
                     prompt_name=prompt_name,
                 )
-        return validated.model_dump(mode="json")
+
+        payload_result = validated.model_dump(mode="json")
+        if self.optimization.enable_layer_cache and self.cache_store is not None:
+            self.cache_store.set_agent(cache_key, payload_result)
+        return payload_result
+
     def proposer_agent(self, state: NegotiationState) -> NegotiationState:
         proposal = self._invoke_agent(
             agent_name="proposer",
@@ -1918,6 +2193,16 @@ class NegotiationAgents:
         default_new_ids = list(evidence_sync.get("new_evidence_ids", []))
         default_resolved_ids = list(evidence_sync.get("implicitly_resolved_ids", []))
 
+        execution_path, agreement_score = self._decide_execution_path(
+            state=state_for_arbiter,
+            iterations=iterations,
+            unresolved_gaps=unresolved_gaps,
+            explicit_conflict=explicit_conflict,
+            consensus_signal=consensus_signal,
+            loop_detected=loop_detected,
+        )
+        early_exit_reason = ""
+
         if iterations < self.min_rounds:
             arbiter_result = {
                 "arbiter_action": "retry",
@@ -1966,6 +2251,30 @@ class NegotiationAgents:
                 "retained_evidence_ids": default_retained_ids,
                 "new_evidence_ids": default_new_ids,
             }
+        elif (
+            self.optimization.enable_adaptive_rounds
+            and execution_path == "fast"
+            and iterations >= self.min_rounds
+            and iterations <= self.fast_path_max_rounds
+            and not explicit_conflict
+            and not unresolved_gaps
+        ):
+            early_exit_reason = f"fast_path_agreement={agreement_score:.3f}"
+            arbiter_result = {
+                "arbiter_action": "finalize",
+                "decision_reason_type": "evidence_closed",
+                "final_label": arbiter_result.get("final_label") or proposal_label,
+                "case_closed": True,
+                "loop_detected": False,
+                "loop_reason": "",
+                "decision_reason": "Fast-path close: consensus and evidence are stable enough for early finalization.",
+                "next_focus": "",
+                "retry_reason_type": None,
+                "consensus_status": "closed_fast_path",
+                "resolved_evidence_ids": default_resolved_ids,
+                "retained_evidence_ids": default_retained_ids,
+                "new_evidence_ids": default_new_ids,
+            }
         else:
             if _can_finalize_evidence_closed(
                 state_for_arbiter,
@@ -1989,7 +2298,8 @@ class NegotiationAgents:
                 }
             else:
                 should_retry = (
-                    iterations < self.max_rounds
+                    execution_path == "deep"
+                    and iterations < self.max_rounds
                     and (explicit_conflict or unresolved_gaps or not consensus_signal)
                     and bool(round_analysis.get("semantic_progress_detected"))
                     and bool(round_analysis.get("next_focus_narrowed"))
@@ -2070,6 +2380,8 @@ class NegotiationAgents:
             final_label=validated["final_label"],
             debate_focus=str(validated["next_focus"]).strip() if validated["arbiter_action"] == "retry" else "",
             debate_gaps=unresolved_gaps,
+            execution_path=execution_path,
+            early_exit_reason=early_exit_reason,
         )
 
         common_payload = {
@@ -2084,6 +2396,8 @@ class NegotiationAgents:
             "persistent_evidence": evidence_resolution["persistent_evidence"],
             "resolved_evidence": evidence_resolution["resolved_evidence"],
             "evidence_events": evidence_resolution["evidence_events"],
+            "execution_path": execution_path,
+            "early_exit_reason": early_exit_reason,
         }
 
         if validated["arbiter_action"] == "retry":
@@ -2125,14 +2439,6 @@ class NegotiationAgents:
             "working_memory": _build_working_memory(updated_state),
             "evidence_pack": _build_evidence_pack(updated_state),
         }
-
-
-
-
-
-
-
-
 
 
 

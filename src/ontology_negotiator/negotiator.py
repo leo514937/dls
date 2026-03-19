@@ -13,7 +13,15 @@ from ontology_negotiator.artifacts import ArtifactManager
 from ontology_negotiator.config import build_chat_openai_kwargs, load_app_config
 from ontology_negotiator.errors import NegotiationConfigurationError
 from ontology_negotiator.graph_builder import build_negotiation_graph
-from ontology_negotiator.models import ClassificationResult, GraphContext, GraphInput, GraphNode, NegotiationState
+from ontology_negotiator.models import (
+    ClassificationResult,
+    GraphContext,
+    GraphInput,
+    GraphNode,
+    LLMTracePayload,
+    NegotiationState,
+)
+from ontology_negotiator.optimization import LayerCacheStore, resolve_model_name, stable_cache_key
 from ontology_negotiator.vault import match_vault
 
 try:
@@ -40,6 +48,8 @@ class OntologyNegotiator:
         model_name: str | None = None,
         llm_kwargs: dict[str, Any] | None = None,
         config_path: Path | str | None = None,
+        fast_llm: Any | None = None,
+        quality_llm: Any | None = None,
     ) -> None:
         self.config_path = Path(config_path) if config_path else None
         self.app_config = load_app_config(self.config_path)
@@ -53,8 +63,13 @@ class OntologyNegotiator:
             raise NegotiationConfigurationError("No usable LLM is configured.")
         if not hasattr(self.llm, "generate_json") and not hasattr(self.llm, "invoke"):
             raise NegotiationConfigurationError("LLM must support generate_json or invoke.")
+
+        self.fast_llm = fast_llm or self.llm
+        self.quality_llm = quality_llm or self.llm
+
         self.artifacts = ArtifactManager(artifact_root=artifact_root)
         self._thread_local = threading.local()
+        self.cache_store = LayerCacheStore(enabled=bool(self.app_config.optimization.enable_layer_cache))
 
     def _build_llm(self, model_name: str | None, llm_kwargs: dict[str, Any]) -> Any | None:
         if ChatOpenAI is None:
@@ -71,7 +86,7 @@ class OntologyNegotiator:
             return None
         if not chat_openai_kwargs.get("api_key"):
             raise NegotiationConfigurationError("Missing openai.api_key for model invocation.")
-        if "model_kwargs" not in chat_openai_kwargs:
+        if "model_kwargs" not in chat_openai_kwargs and not self.app_config.optimization.enable_tool_calling:
             chat_openai_kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
         return ChatOpenAI(**chat_openai_kwargs)
 
@@ -90,12 +105,22 @@ class OntologyNegotiator:
             return None
         if not fallback_kwargs.get("api_key"):
             raise NegotiationConfigurationError("Missing openai.api_key for fallback model invocation.")
-        if "model_kwargs" not in fallback_kwargs:
+        if "model_kwargs" not in fallback_kwargs and not self.app_config.optimization.enable_tool_calling:
             fallback_kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
         return ChatOpenAI(**fallback_kwargs)
 
     def _build_runtime(self) -> NegotiationRuntime:
-        agents = NegotiationAgents(llm=self.llm, fallback_llm=self.fallback_llm, retry_policy=self.retry_policy, min_rounds=self.app_config.negotiation.min_rounds, max_rounds=self.app_config.negotiation.max_rounds)
+        agents = NegotiationAgents(
+            llm=self.llm,
+            fallback_llm=self.fallback_llm,
+            retry_policy=self.retry_policy,
+            min_rounds=self.app_config.negotiation.min_rounds,
+            max_rounds=self.app_config.negotiation.max_rounds,
+            optimization=self.app_config.optimization,
+            cache_store=self.cache_store,
+            fast_llm=self.fast_llm,
+            quality_llm=self.quality_llm,
+        )
         workflow = build_negotiation_graph(agents)
         return NegotiationRuntime(agents=agents, workflow=workflow)
 
@@ -204,22 +229,73 @@ class OntologyNegotiator:
                 return node
         raise ValueError(f"Unknown node_id: {node_id}")
 
+    def _build_vault_context(
+        self,
+        *,
+        node_payload: dict[str, Any],
+        graph_context_payload: dict[str, Any],
+        llm_trace: list[dict[str, Any]],
+        cache_hits: dict[str, int],
+    ) -> dict[str, Any]:
+        model_id = resolve_model_name(self.quality_llm)
+        fallback_model_id = resolve_model_name(self.fallback_llm)
+        cache_key = stable_cache_key(
+            {
+                "node": node_payload,
+                "graph": graph_context_payload,
+                "model": model_id,
+                "fallback_model": fallback_model_id,
+            }
+        )
+
+        cached = self.cache_store.get_vault(cache_key)
+        if cached is not None:
+            cache_hits["vault"] = int(cache_hits.get("vault", 0)) + 1
+            cache_hits["total"] = int(cache_hits.get("total", 0)) + 1
+            llm_trace.append(
+                LLMTracePayload(
+                    agent_name="vault",
+                    stage="cache_hit",
+                    iteration=1,
+                    prompt_name="vault_system",
+                    llm_model=model_id,
+                    fallback_model=fallback_model_id,
+                    fallback_used=False,
+                    attempts=0,
+                    success=True,
+                    cache_hit=True,
+                ).model_dump(mode="json")
+            )
+            return cached
+
+        vault_context = match_vault(
+            node_payload,
+            graph_context_payload,
+            llm=self.quality_llm,
+            fallback_llm=self.fallback_llm,
+            retry_policy=self.retry_policy,
+            trace_collector=llm_trace,
+        )
+        self.cache_store.set_vault(cache_key, vault_context)
+        return vault_context
+
     def _build_initial_state(self, node: GraphNode, graph: GraphInput) -> NegotiationState:
         graph_context = self._build_graph_context(node, graph)
         node_payload = node.model_dump(mode="json")
         graph_context_payload = graph_context.model_dump(mode="json")
         llm_trace: list[dict[str, Any]] = []
+        cache_hits: dict[str, int] = {"vault": 0, "agent": 0, "total": 0}
+        vault_context = self._build_vault_context(
+            node_payload=node_payload,
+            graph_context_payload=graph_context_payload,
+            llm_trace=llm_trace,
+            cache_hits=cache_hits,
+        )
+
         return {
             "node_data": node_payload,
             "graph_context": graph_context_payload,
-            "vault_context": match_vault(
-                node_payload,
-                graph_context_payload,
-                llm=self.llm,
-                fallback_llm=self.fallback_llm,
-                retry_policy=self.retry_policy,
-                trace_collector=llm_trace,
-            ),
+            "vault_context": vault_context,
             "proposal": {},
             "critique": {},
             "history": [],
@@ -242,7 +318,11 @@ class OntologyNegotiator:
             "persistent_evidence": [],
             "resolved_evidence": [],
             "evidence_events": [],
+            "execution_path": "deep",
+            "early_exit_reason": "",
+            "cache_hits": cache_hits,
         }
+
     def _build_graph_context(self, node: GraphNode, graph: GraphInput) -> GraphContext:
         linked_edges = [
             edge
@@ -256,8 +336,4 @@ class OntologyNegotiator:
                     neighbor_ids.append(candidate_id)
         neighbors = [candidate for candidate in graph.nodes if candidate.node_id in neighbor_ids]
         return GraphContext(neighbors=neighbors, edges=linked_edges)
-
-
-
-
 

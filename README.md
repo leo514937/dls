@@ -1,4 +1,4 @@
-﻿# OntologyNegotiator
+# OntologyNegotiator
 
 `OntologyNegotiator` 是一个基于 `langgraph` 的“达 / 类 / 私”本体协商模块。它接收图结构输入，按节点执行 `Proposer -> Critic -> Arbiter -> Evaluator` 的循环辩论，并输出：
 
@@ -144,100 +144,57 @@ python scripts/run_fishhome_negotiation.py
                                           |
                                           v
 +----------------------------------------------------------------------------------+
-|                             1. 运行时与调度层                                     |
+|                         1. 运行时、调度与优化层 (New!)                             |
 +----------------------------------------------------------------------------------+
-| OntologyNegotiator                                                                |
-| - 加载 config/ontology_negotiator.toml                                           |
-| - 构造主 LLM / fallback LLM                                                      |
-| - 为每个节点构造初始 NegotiationState                                             |
-| - 可并发 classify_graph(max_concurrency)                                         |
+| NegotiationAgents (优化核心)                                                     |
+| - Layered Cache: 基于状态指纹的层级缓存，加速重复计算                            |
+| - Tool Calling: 支持 Function Calling (Schema 级约束，失败自动 JSON 回退)         |
+| - Adaptive Path: 根据共识稳定性自动切换 Fast-path (快速收口) 与 Deep-path        |
+| - LLM Fallback: 主模型限流时自动无缝切换至备选模型                               |
 +-----------------------------------------+----------------------------------------+
                                           |
                                           v
 +----------------------------------------------------------------------------------+
 |                           2. 初始上下文构建层                                     |
 +----------------------------------------------------------------------------------+
-| node_data                                                                         |
-| graph_context                                                                     |
-| vault_context  <-----  vault.py 中的 match_vault()                               |
-|                                                                                  |
-| 初始状态还会创建:                                                                 |
-| - proposal / critique / history                                                  |
-| - persistent_evidence / resolved_evidence / evidence_events                      |
-| - debate_focus / debate_gaps / round_summaries                                   |
+| node_data + graph_context + vault_context                                         |
+| vault.py (语义匹配)  <-- 提取基础规律/普适原理证据                                |
 +-----------------------------------------+----------------------------------------+
                                           |
                                           v
 +----------------------------------------------------------------------------------+
 |                         3. LangGraph 协商状态机层                                 |
 +----------------------------------------------------------------------------------+
-| START -> proposer_agent -> critic_agent -> arbiter_node -> evaluator_agent -> END|
-|                                   ^                  |                            |
-|                                   |                  |                            |
-|                                   +------ retry -----+                            |
+|  START --> proposer_agent --> critic_agent --> arbiter_node                      |
+|                ^                                    |                            |
+|                |             [retry]                |                            |
+|                +------------------------------------+                            |
+|                                                     | [finalize]                 |
+|                                                     v                            |
+|  END <--------------------------------------- evaluator_agent                     |
 +-----------------------------------------+----------------------------------------+
                                           |
                                           v
 +----------------------------------------------------------------------------------+
-|                          4. 四类 Agent 执行层                                    |
+|                        4. 工作记忆 + 语义证据保险箱层                              |
 +----------------------------------------------------------------------------------+
-| Proposer                                                                          |
-| - 基于 evidence_pack + working_memory 给出 label / reason / uncertainties        |
+| working_memory (短期上下文)                                                       |
+| - focus / gaps / logic_path / recent_turns                                       |
 |                                                                                  |
-| Critic                                                                            |
-| - 反驳或部分同意 proposer                                                        |
-| - 产出 remaining_gaps / open_questions / counter_evidence                        |
-|                                                                                  |
-| Arbiter                                                                           |
-| - 先同步 persistent evidence vault                                               |
-| - 再读取 working_memory 做 retry/finalize 裁决                                    |
-| - 给出 next_focus / resolved_evidence_ids / retained_evidence_ids                |
-|                                                                                  |
-| Evaluator                                                                         |
-| - 在 final_label 基础上给出 confidence 和审计意见                                 |
+| persistent evidence vault (长期证据链)                                           |
+| - 状态: active (活跃) / resolved (已解决)                                         |
+| - 生命周期事件: opened -> narrowed -> resolved                                    |
 +-----------------------------------------+----------------------------------------+
                                           |
                                           v
 +----------------------------------------------------------------------------------+
-|                         5. 工作记忆 + 证据保险箱层                                |
+|                      5. 语义分析与“狡辩/陷循环”检测层                             |
 +----------------------------------------------------------------------------------+
-| short-term working_memory                                                         |
-| - focus / gaps / proposal_snapshot / critique_snapshot                           |
-| - last_round_summary / recent_turns                                              |
-| - active_evidence_digest / resolved_evidence_digest                              |
-| - evidence_status_summary / last_logic_path_signature                            |
-|                                                                                  |
-| persistent evidence vault                                                        |
-| - persistent_evidence: 当前仍未解决的关键证据                                     |
-| - resolved_evidence: 已解决证据                                                   |
-| - evidence_events: opened / retained / narrowed / resolved / reopened            |
+| agents.py 分层签名逻辑                                                            |
+| - _build_signature: anchor_refs | logic_op | object_terms | claim_type           |
+| - _signatures_equivalent: 语义级等效性判断 (识别绕圈子辩论)                      |
+| - _detect_repeat_loop: 识别逻辑路径未偏移的空转，强制收口                         |
 +-----------------------------------------+----------------------------------------+
-                                          |
-                                          v
-+----------------------------------------------------------------------------------+
-|                      6. 语义分析与停机判定层                                      |
-+----------------------------------------------------------------------------------+
-| agents.py 中的本地逻辑                                                            |
-| - _build_signature(): anchor_refs / logic_operator / object_terms / claim_type   |
-| - _signatures_equivalent(): 判断同义改写是否其实是同一逻辑问题                    |
-| - _sync_persistent_evidence(): 候选证据与保险箱对账                               |
-| - _analyze_round_progress(): 比较本轮与上一轮的 logic_path / evidence 集合        |
-| - _detect_repeat_loop(): 识别“逻辑路径未偏移”的空转争论                           |
-+-----------------------------------------+----------------------------------------+
-                                          |
-                                          v
-+----------------------------------------------------------------------------------+
-|                           7. 结果与产物落盘层                                     |
-+----------------------------------------------------------------------------------+
-| artifacts.py                                                                      |
-| - write_debate(): 保存节点级 debate JSON                                          |
-| - write_results(): 保存 ontology_results.json / labeled_graph.json               |
-|                                                                                  |
-| debates artifact 中会记录:                                                        |
-| - proposal / critique / working_memory                                            |
-| - round_summaries / audit_history                                                 |
-| - persistent_evidence / resolved_evidence / evidence_events                      |
-+----------------------------------------------------------------------------------+
 ```
 
 ## 各结构实现细节
